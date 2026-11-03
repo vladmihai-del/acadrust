@@ -726,57 +726,26 @@ fn acds_fill(acis: &mut crate::entities::solid3d::AcisData, blob: Vec<u8>) {
     acis.version = crate::entities::solid3d::AcisVersion::Version2;
 }
 
-/// Apply a SAB blob to a modeler entity, deriving its placement reference point
-/// now that the geometry is available. Returns false for non-modeler entities.
+/// Apply a SAB blob to a modeler entity. Returns false for non-modeler
+/// entities.
+///
+/// The placement reference point is not derived here: that parses the whole
+/// SAB, and nothing needs it at load time. An entity whose file carried an
+/// inline wireframe anchor keeps it in `point_of_reference`; for the rest,
+/// `reference_point()` on the entity derives it when asked.
 fn acds_apply(entity: &mut crate::entities::EntityType, blob: Vec<u8>) -> bool {
     use crate::entities::EntityType;
     match entity {
         EntityType::Solid3D(s) => {
             acds_fill(&mut s.acis_data, blob);
-            // The inline wireframe anchor (bbox centre) is the preferred
-            // reference point; fall back to the SAB placement translation
-            // only when the file carried none.
-            if s.point_of_reference == crate::types::Vector3::ZERO {
-                if let Some(p) = s
-                    .acis_data
-                    .geometry_centre()
-                    .or_else(|| s.acis_data.placement_origin())
-                {
-                    s.point_of_reference = p;
-                }
-            }
             true
         }
         EntityType::Region(r) => {
             acds_fill(&mut r.acis_data, blob);
-            // The inline wireframe anchor (bbox centre) is the preferred
-            // reference point; fall back to the SAB placement translation
-            // only when the file carried none.
-            if r.point_of_reference == crate::types::Vector3::ZERO {
-                if let Some(p) = r
-                    .acis_data
-                    .geometry_centre()
-                    .or_else(|| r.acis_data.placement_origin())
-                {
-                    r.point_of_reference = p;
-                }
-            }
             true
         }
         EntityType::Body(b) => {
             acds_fill(&mut b.acis_data, blob);
-            // The inline wireframe anchor (bbox centre) is the preferred
-            // reference point; fall back to the SAB placement translation
-            // only when the file carried none.
-            if b.point_of_reference == crate::types::Vector3::ZERO {
-                if let Some(p) = b
-                    .acis_data
-                    .geometry_centre()
-                    .or_else(|| b.acis_data.placement_origin())
-                {
-                    b.point_of_reference = p;
-                }
-            }
             true
         }
         EntityType::Surface(s) => {
@@ -795,19 +764,18 @@ fn attach_acds_record_blobs(
     record_blobs: Vec<(u64, Vec<u8>)>,
 ) -> usize {
     document.acis_sab_handles.clear();
-    // Cleaning a blob and finding its reference point parses the whole SAB,
-    // and the blobs are independent: do that for all of them in parallel,
-    // then hand the results to the document in record order.
+    // The blobs are independent: clean them all in parallel, then hand the
+    // results to the document in record order. The SAB is not parsed here (see
+    // `acds_apply`).
     let prepared = super::parallel::map_ordered(record_blobs, |(h, blob)| {
         let mut acis = crate::entities::solid3d::AcisData::default();
         acds_fill(&mut acis, blob);
-        let centre = acis.geometry_centre().or_else(|| acis.placement_origin());
-        (h, acis, centre)
+        (h, acis)
     });
     let mut attached = 0usize;
-    for (h, acis, centre) in prepared {
+    for (h, acis) in prepared {
         if let Some(entity) = document.get_entity_mut(crate::Handle::new(h)) {
-            if acds_apply_prepared(entity, acis, centre) {
+            if acds_apply_prepared(entity, acis) {
                 attached += 1;
             }
         }
@@ -815,30 +783,24 @@ fn attach_acds_record_blobs(
     attached
 }
 
-/// [`acds_apply`] with the blob already cleaned into `acis` and its reference
-/// point already found, so the expensive part can run off the document.
+/// [`acds_apply`] with the blob already cleaned into `acis`, so the cleaning
+/// can run off the document.
 fn acds_apply_prepared(
     entity: &mut crate::entities::EntityType,
     acis: crate::entities::solid3d::AcisData,
-    centre: Option<crate::types::Vector3>,
 ) -> bool {
     use crate::entities::EntityType;
-    let (data, point) = match entity {
-        EntityType::Solid3D(s) => (&mut s.acis_data, Some(&mut s.point_of_reference)),
-        EntityType::Region(r) => (&mut r.acis_data, Some(&mut r.point_of_reference)),
-        EntityType::Body(b) => (&mut b.acis_data, Some(&mut b.point_of_reference)),
-        EntityType::Surface(s) => (&mut s.acis_data, None),
+    let data = match entity {
+        EntityType::Solid3D(s) => &mut s.acis_data,
+        EntityType::Region(r) => &mut r.acis_data,
+        EntityType::Body(b) => &mut b.acis_data,
+        EntityType::Surface(s) => &mut s.acis_data,
         _ => return false,
     };
     data.sab_data = acis.sab_data;
     data.sat_data = acis.sat_data;
     data.is_binary = acis.is_binary;
     data.version = acis.version;
-    if let (Some(point), Some(centre)) = (point, centre) {
-        if *point == crate::types::Vector3::ZERO {
-            *point = centre;
-        }
-    }
     true
 }
 
@@ -3722,6 +3684,59 @@ mod dwg_reader_tests {
     #[test]
     fn empty_when_first_byte_null() {
         assert_eq!(section_name_from_field(&[0u8; 64]), "");
+    }
+
+    #[test]
+    fn acds_attach_defers_the_reference_point_until_asked() {
+        use crate::entities::acis::{SabWriter, SatDocument};
+        use crate::entities::{Body, EntityType, Region, Solid3D};
+        use crate::types::Vector3;
+
+        // A body whose two vertex points have the bounding-box centre (2, 4, 6).
+        let mut sat = SatDocument::new_body();
+        sat.add_point(0.0, 0.0, 0.0);
+        sat.add_point(4.0, 8.0, 12.0);
+        let sab = SabWriter::write(&sat);
+
+        let mut document = crate::document::CadDocument::new();
+        let solid = document
+            .add_entity(EntityType::Solid3D(Solid3D::new()))
+            .unwrap();
+        let region = document
+            .add_entity(EntityType::Region(Region::new()))
+            .unwrap();
+        let body = document.add_entity(EntityType::Body(Body::new())).unwrap();
+        let blobs = [solid, region, body]
+            .iter()
+            .map(|h| (h.value(), sab.clone()))
+            .collect();
+
+        assert_eq!(super::attach_acds_record_blobs(&mut document, blobs), 3);
+
+        // Attaching stored the blob but did not parse it for a centre.
+        let centre = Vector3::new(2.0, 4.0, 6.0);
+        match document.get_entity(solid) {
+            Some(EntityType::Solid3D(s)) => {
+                assert_eq!(s.acis_data.sab_data, sab);
+                assert_eq!(s.point_of_reference, Vector3::ZERO);
+                assert_eq!(s.reference_point(), centre);
+            }
+            other => panic!("expected a solid, got {other:?}"),
+        }
+        match document.get_entity(region) {
+            Some(EntityType::Region(r)) => {
+                assert_eq!(r.point_of_reference, Vector3::ZERO);
+                assert_eq!(r.reference_point(), centre);
+            }
+            other => panic!("expected a region, got {other:?}"),
+        }
+        match document.get_entity(body) {
+            Some(EntityType::Body(b)) => {
+                assert_eq!(b.point_of_reference, Vector3::ZERO);
+                assert_eq!(b.reference_point(), centre);
+            }
+            other => panic!("expected a body, got {other:?}"),
+        }
     }
 
     #[test]
