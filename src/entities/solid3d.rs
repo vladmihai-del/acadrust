@@ -485,6 +485,15 @@ impl AcisData {
         Some(Vector3::new(t[0], t[1], t[2]))
     }
 
+    /// The reference point derived from the geometry itself: the vertex-point
+    /// bounding-box centre ([`geometry_centre`](Self::geometry_centre)), else
+    /// the placement origin ([`placement_origin`](Self::placement_origin)).
+    /// Parses the modeler data on every call, so ask for it when it is needed
+    /// rather than at load time.
+    pub fn reference_centre(&self) -> Option<Vector3> {
+        self.geometry_centre().or_else(|| self.placement_origin())
+    }
+
     /// The centre of the body's vertex-point bounding box, in world space
     /// (body placement applied). `None` when the data can't be parsed or
     /// carries no `point` records. Approximates the geometric centre well for
@@ -669,6 +678,19 @@ impl Solid3D {
             silhouettes: Vec::new(),
             history_handle: None,
         }
+    }
+
+    /// The solid's reference point: the stored `point_of_reference` when the
+    /// file carried one, else the point derived from the geometry
+    /// ([`AcisData::reference_centre`]), else the origin. Modeler data read from
+    /// a DWG's external AcDs section no longer has its geometry parsed at load
+    /// time, so `point_of_reference` stays at the origin for such a solid unless
+    /// the file stored an anchor; call this to get the derived point.
+    pub fn reference_point(&self) -> Vector3 {
+        if self.point_of_reference != Vector3::ZERO {
+            return self.point_of_reference;
+        }
+        self.acis_data.reference_centre().unwrap_or(Vector3::ZERO)
     }
 
     /// Creates a 3D solid from SAT text data.
@@ -875,6 +897,16 @@ impl Region {
         }
     }
 
+    /// The region's reference point: the stored `point_of_reference`, else the
+    /// point derived from the geometry ([`AcisData::reference_centre`]), else
+    /// the origin. See [`Solid3D::reference_point`].
+    pub fn reference_point(&self) -> Vector3 {
+        if self.point_of_reference != Vector3::ZERO {
+            return self.point_of_reference;
+        }
+        self.acis_data.reference_centre().unwrap_or(Vector3::ZERO)
+    }
+
     /// Creates a region from SAT text data.
     pub fn from_sat(sat: &str) -> Self {
         let mut region = Self::new();
@@ -1002,6 +1034,16 @@ impl Body {
             silhouettes: Vec::new(),
             history_handle: None,
         }
+    }
+
+    /// The body's reference point: the stored `point_of_reference`, else the
+    /// point derived from the geometry ([`AcisData::reference_centre`]), else
+    /// the origin. See [`Solid3D::reference_point`].
+    pub fn reference_point(&self) -> Vector3 {
+        if self.point_of_reference != Vector3::ZERO {
+            return self.point_of_reference;
+        }
+        self.acis_data.reference_centre().unwrap_or(Vector3::ZERO)
     }
 
     /// Creates a body from SAT text data.
